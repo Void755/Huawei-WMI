@@ -60,7 +60,26 @@ enum {
 	BATTERY_CHARGE_MODE_SET = 0x00001503, /* \SBCM */
 	BATTERY_CHARGE_MODE_PARAM_GET = 0x00001303, /* \GBAC */
 	BATTERY_CHARGE_MODE_PARAM_SET = 0x00001203, /* \SBAC */
+	BIOS_SWITCH_GET         = 0x00000105, /* \GBSW */
+	BIOS_SWITCH_GET_MEM     = 0x00000605, /* \GBTW */
+	BIOS_LOGO_SET           = 0x00000106, /* \SBLG */
+	BIOS_LOGO_GET           = 0x00000206, /* \GBLG */
 };
+
+enum {
+	BIOS_INFO_CLASS_FEATURE      = 0x02,
+	BIOS_INFO_CLASS_LOGO_LIGHT   = 0x05,
+	BIOS_INFO_CMD_FEATURE_SWITCH = 0x10,
+	BIOS_INFO_CMD_LOGO_GET       = 0x09,
+	BIOS_INFO_CMD_LOGO_SET       = 0x0a,
+	BIOS_INFO_FEATURE_TURBO_CHARGE = 0x02,
+	BIOS_INFO_FEATURE_OP_GET     = 0x00,
+	BIOS_INFO_FEATURE_OP_SET     = 0x01,
+	BIOS_INFO_FEATURE_GET_SUPPORT = 0x00,
+	BIOS_INFO_FEATURE_GET_STATUS = 0x01,
+};
+
+#define BIOS_INFO_INPUT_SIZE 0x40
 
 union hwmi_arg {
 	u64 cmd;
@@ -89,6 +108,8 @@ struct huawei_wmi {
 	bool kbdlight_available;
 	bool kbdlight_quirk_input;
 	bool kbdlight_timeout_available;
+	bool logo_light_available;
+	bool turbo_charge_available;
 	bool power_unlock_available;
 	bool fan_speed_available;
 	bool temp_available;
@@ -322,15 +343,8 @@ static int huawei_wmi_call(struct huawei_wmi *huawei,
 	return 0;
 }
 
-/* HWMI takes a 64 bit input and returns either a package with 2 buffers, one of
- * 4 bytes and the other of 256 bytes, or one buffer of size 0x104 (260) bytes.
- * The first 4 bytes are ignored, we ignore the first 4 bytes buffer if we got a
- * package, or skip the first 4 if a buffer of 0x104 is used. The first byte of
- * the remaining 0x100 sized buffer has the return status of every call. In case
- * the return status is non-zero, we return -ENODEV but still copy the returned
- * buffer to the given buffer parameter (buf).
- */
-static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
+static int huawei_wmi_exec(const void *input, size_t input_len,
+		u8 *buf, size_t buflen)
 {
 	struct huawei_wmi *huawei = huawei_wmi;
 	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
@@ -339,8 +353,11 @@ static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
 	size_t len;
 	int err, i;
 
-	in.length = sizeof(arg);
-	in.pointer = &arg;
+	if (!input || !input_len)
+		return -EINVAL;
+
+	in.length = input_len;
+	in.pointer = (void *)input;
 
 	/* Some models require calling HWMI twice to execute a command. We evaluate
 	 * HWMI and if we get a non-zero return status we evaluate it again.
@@ -412,6 +429,36 @@ static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
 fail_cmd:
 	kfree(out.pointer);
 	return err;
+}
+
+/* HWMI takes a 64 bit input and returns either a package with 2 buffers, one of
+ * 4 bytes and the other of 256 bytes, or one buffer of size 0x104 (260) bytes.
+ * The first 4 bytes are ignored, we ignore the first 4 bytes buffer if we got a
+ * package, or skip the first 4 if a buffer of 0x104 is used. The first byte of
+ * the remaining 0x100 sized buffer has the return status of every call. In case
+ * the return status is non-zero, we return -ENODEV but still copy the returned
+ * buffer to the given buffer parameter (buf).
+ */
+static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
+{
+	return huawei_wmi_exec(&arg, sizeof(arg), buf, buflen);
+}
+
+static int huawei_wmi_bios_info_cmd(u8 cls, u8 cmd,
+		const u8 *in_payload, size_t in_payload_len,
+		u8 *buf, size_t buflen)
+{
+	u8 in[BIOS_INFO_INPUT_SIZE] = { 0 };
+
+	if (in_payload_len > BIOS_INFO_INPUT_SIZE - 2)
+		return -EINVAL;
+
+	in[0] = cls;
+	in[1] = cmd;
+	if (in_payload && in_payload_len)
+		memcpy(&in[2], in_payload, in_payload_len);
+
+	return huawei_wmi_exec(in, sizeof(in), buf, buflen);
 }
 
 /* LEDs */
@@ -1169,6 +1216,217 @@ static void huawei_wmi_kbdlight_timeout_exit(struct device *dev)
 		device_remove_file(dev, &dev_attr_kbdlight_timeout);
 }
 
+/* Logo light */
+
+static int huawei_wmi_logo_light_get(int *on)
+{
+	u8 ret[HWMI_BUFF_SIZE] = { 0 };
+	int err;
+
+	err = huawei_wmi_bios_info_cmd(BIOS_INFO_CLASS_LOGO_LIGHT,
+			BIOS_INFO_CMD_LOGO_GET, NULL, 0, ret, HWMI_BUFF_SIZE);
+	if (err)
+		return err;
+
+	if (on)
+		*on = !!ret[1];
+
+	return 0;
+}
+
+static int huawei_wmi_logo_light_set(int on)
+{
+	u8 payload[1];
+
+	if (on < 0 || on > 1)
+		return -EINVAL;
+
+	payload[0] = on;
+
+	return huawei_wmi_bios_info_cmd(BIOS_INFO_CLASS_LOGO_LIGHT,
+			BIOS_INFO_CMD_LOGO_SET, payload, sizeof(payload), NULL, 0);
+}
+
+static ssize_t logo_light_show(struct device *dev,
+		struct device_attribute *attr,
+		char *buf)
+{
+	int err, on;
+
+	err = huawei_wmi_logo_light_get(&on);
+	if (err)
+		return err;
+
+	return sprintf(buf, "%d\n", on);
+}
+
+static ssize_t logo_light_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t size)
+{
+	int on, err;
+
+	if (kstrtoint(buf, 10, &on))
+		return -EINVAL;
+
+	err = huawei_wmi_logo_light_set(on);
+	if (err)
+		return err;
+
+	return size;
+}
+
+static DEVICE_ATTR_RW(logo_light);
+
+static void huawei_wmi_logo_light_setup(struct device *dev)
+{
+	struct huawei_wmi *huawei = dev_get_drvdata(dev);
+
+	huawei->logo_light_available = true;
+	if (huawei_wmi_logo_light_get(NULL)) {
+		huawei->logo_light_available = false;
+		return;
+	}
+
+	device_create_file(dev, &dev_attr_logo_light);
+}
+
+static void huawei_wmi_logo_light_exit(struct device *dev)
+{
+	struct huawei_wmi *huawei = dev_get_drvdata(dev);
+
+	if (huawei->logo_light_available)
+		device_remove_file(dev, &dev_attr_logo_light);
+}
+
+/* Turbo charge */
+
+static int huawei_wmi_turbo_charge_get_support(int *supported)
+{
+	u8 payload[5] = {
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		0xd3,
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		BIOS_INFO_FEATURE_OP_GET,
+		BIOS_INFO_FEATURE_GET_SUPPORT,
+	};
+	u8 ret[HWMI_BUFF_SIZE] = { 0 };
+	int err;
+
+	err = huawei_wmi_bios_info_cmd(BIOS_INFO_CLASS_FEATURE,
+			BIOS_INFO_CMD_FEATURE_SWITCH,
+			payload, sizeof(payload), ret, HWMI_BUFF_SIZE);
+	if (err)
+		return err;
+
+	if (supported)
+		*supported = !!ret[2];
+
+	return 0;
+}
+
+static int huawei_wmi_turbo_charge_get(int *on)
+{
+	u8 payload[5] = {
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		0xd3,
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		BIOS_INFO_FEATURE_OP_GET,
+		BIOS_INFO_FEATURE_GET_STATUS,
+	};
+	u8 ret[HWMI_BUFF_SIZE] = { 0 };
+	int err;
+
+	err = huawei_wmi_bios_info_cmd(BIOS_INFO_CLASS_FEATURE,
+			BIOS_INFO_CMD_FEATURE_SWITCH,
+			payload, sizeof(payload), ret, HWMI_BUFF_SIZE);
+	if (err)
+		return err;
+
+	if (on)
+		*on = !!ret[2];
+
+	return 0;
+}
+
+static int huawei_wmi_turbo_charge_set(int on)
+{
+	u8 payload[5] = {
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		0xd3,
+		BIOS_INFO_FEATURE_TURBO_CHARGE,
+		BIOS_INFO_FEATURE_OP_SET,
+		on,
+	};
+
+	if (on < 0 || on > 1)
+		return -EINVAL;
+
+	return huawei_wmi_bios_info_cmd(BIOS_INFO_CLASS_FEATURE,
+			BIOS_INFO_CMD_FEATURE_SWITCH,
+			payload, sizeof(payload), NULL, 0);
+}
+
+static ssize_t turbo_charge_show(struct device *dev,
+		struct device_attribute *attr,
+		char *buf)
+{
+	int err, on;
+
+	err = huawei_wmi_turbo_charge_get(&on);
+	if (err)
+		return err;
+
+	return sprintf(buf, "%d\n", on);
+}
+
+static ssize_t turbo_charge_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t size)
+{
+	int on, err;
+
+	if (kstrtoint(buf, 10, &on))
+		return -EINVAL;
+
+	err = huawei_wmi_turbo_charge_set(on);
+	if (err)
+		return err;
+
+	return size;
+}
+
+static DEVICE_ATTR_RW(turbo_charge);
+
+static void huawei_wmi_turbo_charge_setup(struct device *dev)
+{
+	struct huawei_wmi *huawei = dev_get_drvdata(dev);
+	int supported;
+	int err;
+
+	huawei->turbo_charge_available = true;
+	err = huawei_wmi_turbo_charge_get_support(&supported);
+	if (!err && !supported) {
+		huawei->turbo_charge_available = false;
+		return;
+	}
+
+	if (huawei_wmi_turbo_charge_get(NULL)) {
+		huawei->turbo_charge_available = false;
+		return;
+	}
+
+	device_create_file(dev, &dev_attr_turbo_charge);
+}
+
+static void huawei_wmi_turbo_charge_exit(struct device *dev)
+{
+	struct huawei_wmi *huawei = dev_get_drvdata(dev);
+
+	if (huawei->turbo_charge_available)
+		device_remove_file(dev, &dev_attr_turbo_charge);
+}
+
 /* Power unlock */
 
 static int huawei_wmi_power_unlock_get(int *on)
@@ -1671,6 +1929,8 @@ static int huawei_wmi_probe(struct platform_device *pdev)
 		}
 		huawei_wmi_smart_charge_setup(&pdev->dev);
 		huawei_wmi_smart_charge_param_setup(&pdev->dev);
+		huawei_wmi_turbo_charge_setup(&pdev->dev);
+		huawei_wmi_logo_light_setup(&pdev->dev);
 		huawei_wmi_power_unlock_setup(&pdev->dev);
 		huawei_wmi_kbdlight_timeout_setup(&pdev->dev);
 		huawei_wmi_kbdlight_setup(&pdev->dev);
@@ -1701,6 +1961,8 @@ static void huawei_wmi_remove(struct platform_device *pdev)
 		huawei_wmi_kbdlight_exit(&pdev->dev);
 		huawei_wmi_kbdlight_timeout_exit(&pdev->dev);
 		huawei_wmi_power_unlock_exit(&pdev->dev);
+		huawei_wmi_logo_light_exit(&pdev->dev);
+		huawei_wmi_turbo_charge_exit(&pdev->dev);
 		huawei_wmi_smart_charge_exit(&pdev->dev);
 		huawei_wmi_smart_charge_param_exit(&pdev->dev);
 		if (huawei_wmi->hwmon)
